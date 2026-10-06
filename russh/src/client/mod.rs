@@ -112,10 +112,9 @@ pub struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         debug!("drop session");
-        // Best-effort: push whatever fits into each channel mpsc so consumers
-        // can read the tail after the sender drops. The graceful-exit path
-        // already awaited `flush_into` for full delivery.
-        let _ = self.backlog.drain(&mut self.channels);
+        // Whatever a slow consumer has not read yet outlives the session:
+        // see [`ChannelBacklog::deliver_remaining`].
+        self.backlog.deliver_remaining(&mut self.channels);
     }
 }
 
@@ -1319,6 +1318,12 @@ impl Session {
         self.backlog.close_with(&mut self.channels, id, msg)
     }
 
+    /// The most payload one channel's backlog can hold if the server honours
+    /// the receive window: the largest window it was ever offered.
+    fn backlog_limit(&self) -> usize {
+        self.target_window_size.max(self.common.config.window_size) as usize
+    }
+
     /// Re-open the SSH receive window for `id` if it has dropped below half
     /// the target. Only call this when the channel is not backed up.
     pub(crate) fn replenish_receive_window(&mut self, id: ChannelId) -> Result<bool, Error> {
@@ -1412,11 +1417,17 @@ impl Session {
             // application output in its bounded receivers while a channel is
             // window-blocked.
             let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
+            // A channel holding more than its window allowed means the
+            // server sent without window: leave the rest in the socket
+            // until the consumer catches up, which pushes back on the
+            // server the way a blocking delivery used to. Never during a
+            // key exchange, which needs the server's packets to finish.
+            let can_read_inbound = self.kex.active() || !self.backlog.is_over(self.backlog_limit());
             let rekey_timer =
                 crate::future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
             tokio::select! {
-                r = &mut reading => {
+                r = &mut reading, if can_read_inbound => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
                         Err(e) => return Err(e.into())
