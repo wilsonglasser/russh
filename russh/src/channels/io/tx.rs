@@ -19,8 +19,7 @@ use super::ChannelMsg;
 use crate::ChannelId;
 
 type BoxedThreadsafeFuture<T> = Pin<Box<dyn Sync + Send + std::future::Future<Output = T>>>;
-type OwnedPermitFuture<S> =
-    BoxedThreadsafeFuture<Result<(OwnedPermit<S>, ChannelMsg, usize), SendError<()>>>;
+type OwnedPermitFuture<S> = BoxedThreadsafeFuture<Result<OwnedPermit<S>, SendError<()>>>;
 
 struct WatchNotification(Pin<Box<dyn Sync + Send + Future<Output = ()>>>);
 
@@ -42,9 +41,17 @@ impl Future for WatchNotification {
     }
 }
 
+/// Writes go in two steps, in this order: a place in the session's queue
+/// (`permit`), then the window. The window is reserved and the message
+/// handed over in one poll with no wait between, so a write that is
+/// given up on while it waits (a timeout, a `select!`, the writer
+/// dropped) has taken nothing from the window it will not use. The
+/// place is kept across polls and across writes, so a write that was
+/// waiting on the window resumes where it was.
 pub struct ChannelTx<S> {
     sender: mpsc::Sender<S>,
-    send_fut: Option<OwnedPermitFuture<S>>,
+    permit_fut: Option<OwnedPermitFuture<S>>,
+    permit: Option<OwnedPermit<S>>,
     id: ChannelId,
     window_size_fut: Option<BoxedThreadsafeFuture<OwnedMutexGuard<u32>>>,
     window_size: Arc<Mutex<u32>>,
@@ -68,7 +75,8 @@ where
     ) -> Self {
         Self {
             sender,
-            send_fut: None,
+            permit_fut: None,
+            permit: None,
             id,
             notify: Arc::clone(&window_size_notification),
             window_size_notication: WatchNotification::new(window_size_notification),
@@ -125,27 +133,35 @@ where
         Poll::Ready((msg, writable))
     }
 
-    fn activate(&mut self, msg: ChannelMsg, writable: usize) -> &mut OwnedPermitFuture<S> {
-        use futures::TryFutureExt;
-        self.send_fut.insert(Box::pin(
-            self.sender
-                .clone()
-                .reserve_owned()
-                .map_ok(move |p| (p, msg, writable)),
-        ))
+    /// A place in the session's queue, waited for before any window is
+    /// reserved and held until a message takes it.
+    fn poll_permit(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.permit.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let sender = self.sender.clone();
+        let permit_fut = self
+            .permit_fut
+            .get_or_insert_with(|| Box::pin(sender.reserve_owned()));
+        let r = ready!(permit_fut.poll_unpin(cx));
+        self.permit_fut = None;
+        match r {
+            Ok(permit) => {
+                self.permit = Some(permit);
+                Poll::Ready(Ok(()))
+            }
+            Err(SendError(())) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel closed",
+            ))),
+        }
     }
 
-    fn handle_write_result(
-        &mut self,
-        r: Result<(OwnedPermit<S>, ChannelMsg, usize), SendError<()>>,
-    ) -> Result<usize, io::Error> {
-        self.send_fut = None;
-        match r {
-            Ok((permit, msg, writable)) => {
-                permit.send((self.id, msg).into());
-                Ok(writable)
-            }
-            Err(SendError(())) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed")),
+    /// Hand `msg` to the session through the place taken by
+    /// [`Self::poll_permit`]. Synchronous: nothing can interrupt it.
+    fn send_with_permit(&mut self, msg: ChannelMsg) {
+        if let Some(permit) = self.permit.take() {
+            permit.send((self.id, msg).into());
         }
     }
 }
@@ -154,7 +170,6 @@ impl<S> AsyncWrite for ChannelTx<S>
 where
     S: From<(ChannelId, ChannelMsg)> + 'static + Send,
 {
-    #[allow(clippy::too_many_lines)]
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -166,14 +181,10 @@ where
                 "cannot send empty buffer",
             )));
         }
-        let send_fut = if let Some(x) = self.send_fut.as_mut() {
-            x
-        } else {
-            let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
-            self.activate(msg, writable.into())
-        };
-        let r = ready!(send_fut.as_mut().poll_unpin(cx));
-        Poll::Ready(self.handle_write_result(r))
+        ready!(self.poll_permit(cx))?;
+        let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
+        self.send_with_permit(msg);
+        Poll::Ready(Ok(writable.into()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -184,13 +195,9 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        let send_fut = if let Some(x) = self.send_fut.as_mut() {
-            x
-        } else {
-            self.activate(ChannelMsg::Eof, 0)
-        };
-        let r = ready!(send_fut.as_mut().poll_unpin(cx)).map(|(p, _, _)| (p, ChannelMsg::Eof, 0));
-        Poll::Ready(self.handle_write_result(r).map(drop))
+        ready!(self.poll_permit(cx))?;
+        self.send_with_permit(ChannelMsg::Eof);
+        Poll::Ready(Ok(()))
     }
 }
 
