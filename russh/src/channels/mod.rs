@@ -735,7 +735,13 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
 /// bounded by the window; this bounds what the window does not count: the
 /// per-message cost of very small packets, and messages that carry no
 /// payload at all.
-const BACKLOG_MAX_MSGS: usize = 4096;
+///
+/// Set high on purpose. Stopping the read holds up every channel of the
+/// connection, so it must stay out of reach of a peer that honours the
+/// window: with the default 2 MiB window this many messages fit inside it
+/// only if they average under 32 bytes of payload, and at a few dozen
+/// bytes of bookkeeping each the cap itself is a few megabytes.
+const BACKLOG_MAX_MSGS: usize = 65536;
 
 /// Payload bytes a queued message holds on to.
 fn payload_len(msg: &ChannelMsg) -> usize {
