@@ -725,7 +725,7 @@ impl Session {
                     )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
+                    chan.window_size().grow(amount).await;
                 }
                 self.forward_channel_msg(channel_num, ChannelMsg::WindowAdjusted { new_size });
                 client.window_adjusted(channel_num, new_size, self).await
