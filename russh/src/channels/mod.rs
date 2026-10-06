@@ -730,9 +730,26 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     }
 }
 
+/// The most messages one channel may have queued before the session stops
+/// reading from the network (see [`ChannelBacklog::is_over`]). Payload is
+/// bounded by the window; this bounds what the window does not count: the
+/// per-message cost of very small packets, and messages that carry no
+/// payload at all.
+const BACKLOG_MAX_MSGS: usize = 4096;
+
+/// Payload bytes a queued message holds on to.
+fn payload_len(msg: &ChannelMsg) -> usize {
+    match msg {
+        ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => data.len(),
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChannelQueue {
     queue: VecDeque<ChannelMsg>,
+    /// Payload bytes held in `queue`.
+    bytes: usize,
     /// Set once a terminal message (`Close`/`OpenFailure`) has been queued.
     /// Further forwards are dropped, and [`ChannelBacklog::drain`] removes
     /// the channel (without re-opening its receive window) once this drains.
@@ -753,9 +770,13 @@ struct ChannelQueue {
 /// The queue is bounded by the SSH receive window for compliant peers
 /// (`WINDOW_ADJUST` is withheld while a backlog exists, so the peer's
 /// in-flight data cannot exceed `window_size`). A peer that ignores flow
-/// control can grow it without limit; that is the same exposure as any other
-/// resource an authenticated peer can consume, and is preferred over
-/// silently dropping messages.
+/// control would grow it without limit, so the bound is also enforced
+/// here: once a channel's queue holds more than the window allows, or more
+/// than [`BACKLOG_MAX_MSGS`] messages, [`Self::is_over`] tells the session
+/// loop to stop reading from the network until the consumer catches up.
+/// That is the back-pressure a blocking send used to give, applied only to
+/// a peer that sent what it was never given window for; nothing is
+/// dropped.
 #[derive(Debug, Default)]
 pub(crate) struct ChannelBacklog {
     backed_up: HashMap<ChannelId, ChannelQueue>,
@@ -764,6 +785,49 @@ pub(crate) struct ChannelBacklog {
 impl ChannelBacklog {
     pub(crate) fn is_empty(&self) -> bool {
         self.backed_up.is_empty()
+    }
+
+    /// Whether some channel has more queued than a peer honouring a
+    /// receive window of `window` bytes could have sent. While this holds
+    /// the session must not read further packets off the network.
+    pub(crate) fn is_over(&self, window: usize) -> bool {
+        self.backed_up
+            .values()
+            .any(|q| q.bytes > window || q.queue.len() > BACKLOG_MAX_MSGS)
+    }
+
+    /// For the end of the session: hand every queue that is still backed up
+    /// to a task of its own, which delivers it in order however long the
+    /// consumer takes, and then lets go of the channel.
+    ///
+    /// The session loop is the only caller of [`Self::drain`], so once it
+    /// is gone nothing else would move these messages, and a consumer that
+    /// was behind when the connection ended would lose the end of what the
+    /// peer sent (its last data, its EOF, an exit status).
+    pub(crate) fn deliver_remaining(&mut self, channels: &mut HashMap<ChannelId, ChannelRef>) {
+        // First whatever fits right now, which also settles the channels
+        // that were only waiting to be removed.
+        let _ = self.drain(channels);
+        #[cfg(not(target_arch = "wasm32"))]
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to carry a task (a session dropped outside one):
+            // what fitted above is all that can be delivered.
+            self.backed_up.clear();
+            return;
+        }
+        for (id, q) in self.backed_up.drain() {
+            let Some(chan) = channels.remove(&id) else {
+                continue;
+            };
+            let sender = chan.sender.clone();
+            russh_util::runtime::spawn(async move {
+                for msg in q.queue {
+                    if sender.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     /// Forward `msg` to the [`Channel`] for `id` without blocking.
@@ -795,6 +859,7 @@ impl ChannelBacklog {
         }
         if let Some(q) = self.backed_up.get_mut(&id) {
             if !q.closing {
+                q.bytes += payload_len(&msg);
                 q.queue.push_back(msg);
             }
             return false;
@@ -802,11 +867,9 @@ impl ChannelBacklog {
         match chan.try_send(msg) {
             Ok(()) => true,
             Err(TrySendError::Full(m)) => {
-                self.backed_up
-                    .entry(id)
-                    .or_default()
-                    .queue
-                    .push_back(m);
+                let q = self.backed_up.entry(id).or_default();
+                q.bytes += payload_len(&m);
+                q.queue.push_back(m);
                 false
             }
             Err(TrySendError::Closed(_)) => true,
@@ -846,8 +909,9 @@ impl ChannelBacklog {
                 return false;
             };
             while let Some(front) = q.queue.pop_front() {
+                let len = payload_len(&front);
                 match chan.try_send(front) {
-                    Ok(()) => {}
+                    Ok(()) => q.bytes -= len,
                     Err(TrySendError::Full(m)) => {
                         q.queue.push_front(m);
                         return true;
@@ -1110,6 +1174,68 @@ mod tests {
         assert!(!channels.contains_key(&id));
         assert!(b.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn backlog_is_over_once_it_holds_more_than_the_window() {
+        let id = ChannelId(6);
+        let (mut b, mut channels, mut rx) = dispatch(id, 1);
+
+        // One message in the mpsc, then 3 bytes of backlog.
+        assert!(fwd(&mut b, &channels, id, data_msg(b"a")));
+        assert!(!fwd(&mut b, &channels, id, data_msg(b"bc")));
+        assert!(!fwd(&mut b, &channels, id, data_msg(b"d")));
+        assert!(!b.is_over(3), "a peer within its window is never over");
+        assert!(b.is_over(2), "more queued than the window allowed");
+
+        // Draining brings it back under, message by message.
+        assert_eq!(recv_data(&mut rx).as_ref(), b"a");
+        assert!(b.drain(&mut channels).is_empty());
+        assert!(!b.is_over(2));
+        assert_eq!(recv_data(&mut rx).as_ref(), b"bc");
+        assert_eq!(b.drain(&mut channels), vec![id]);
+        assert!(!b.is_over(0));
+    }
+
+    #[test]
+    fn backlog_is_over_on_too_many_messages_whatever_their_size() {
+        let id = ChannelId(7);
+        let (mut b, channels, _rx) = dispatch(id, 1);
+
+        assert!(fwd(&mut b, &channels, id, ChannelMsg::Success));
+        for _ in 0..BACKLOG_MAX_MSGS {
+            assert!(!fwd(&mut b, &channels, id, ChannelMsg::Success));
+        }
+        assert!(!b.is_over(usize::MAX));
+        assert!(!fwd(&mut b, &channels, id, ChannelMsg::Success));
+        assert!(b.is_over(usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn backlog_is_delivered_after_the_session_is_gone() {
+        let id = ChannelId(8);
+        let (mut b, mut channels, mut rx) = dispatch(id, 1);
+
+        assert!(fwd(&mut b, &channels, id, data_msg(b"1")));
+        assert!(!fwd(&mut b, &channels, id, data_msg(b"2")));
+        assert!(!fwd(&mut b, &channels, id, data_msg(b"3")));
+        assert!(!fwd(&mut b, &channels, id, ChannelMsg::Eof));
+
+        b.deliver_remaining(&mut channels);
+        assert!(b.is_empty());
+        assert!(channels.is_empty(), "the session lets go of the channel");
+        drop(b);
+
+        // A consumer that only starts reading now gets all of it, in
+        // order, and then the end of the channel.
+        for expect in [&b"1"[..], b"2", b"3"] {
+            match rx.recv().await {
+                Some(ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), expect),
+                other => unreachable!("expected Data, got {other:?}"),
+            }
+        }
+        assert!(matches!(rx.recv().await, Some(ChannelMsg::Eof)));
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]

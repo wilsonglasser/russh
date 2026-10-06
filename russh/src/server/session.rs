@@ -44,10 +44,9 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Best-effort: push whatever fits into each channel mpsc so consumers
-        // can read the tail after the sender drops. The graceful-exit path
-        // already awaited `flush_into` for full delivery.
-        let _ = self.backlog.drain(&mut self.channels);
+        // Whatever a slow consumer has not read yet outlives the session:
+        // see [`ChannelBacklog::deliver_remaining`].
+        self.backlog.deliver_remaining(&mut self.channels);
     }
 }
 
@@ -735,9 +734,14 @@ impl Session {
 
             let rekey_timer = future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
+            // A channel holding more than its window allowed means the
+            // client sent without window: leave the rest in the socket
+            // until the consumer catches up. Never during a key exchange,
+            // which needs the client's packets to finish.
+            let can_read_inbound = self.kex.active() || !self.backlog.is_over(self.backlog_limit());
 
             tokio::select! {
-                r = &mut reading => {
+                r = &mut reading, if can_read_inbound => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
                         Err(e) => return Err(e.into())
@@ -917,6 +921,12 @@ impl Session {
     /// See [`ChannelBacklog::close_with`].
     pub(crate) fn close_channel(&mut self, id: ChannelId, msg: ChannelMsg) {
         self.backlog.close_with(&mut self.channels, id, msg)
+    }
+
+    /// The most payload one channel's backlog can hold if the client honours
+    /// the receive window: the largest window it was ever offered.
+    fn backlog_limit(&self) -> usize {
+        self.target_window_size.max(self.common.config.window_size) as usize
     }
 
     /// Re-open the SSH receive window for `id` if it has dropped below half
