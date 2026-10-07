@@ -46,8 +46,13 @@ impl Future for WatchNotification {
 /// handed over in one poll with no wait between, so a write that is
 /// given up on while it waits (a timeout, a `select!`, the writer
 /// dropped) has taken nothing from the window it will not use. The
-/// place is kept across polls and across writes, so a write that was
-/// waiting on the window resumes where it was.
+/// place is kept only while the window is there to use it: a write that
+/// finds the window empty gives its place back before it waits, and
+/// takes a new one when the window re-opens. A place held through that
+/// wait would be a slot of the session's queue parked for as long as the
+/// peer does not read, and enough such writers (the queue is 100 deep
+/// by default) would stop every other channel's messages, opens and
+/// closes included.
 pub struct ChannelTx<S> {
     sender: mpsc::Sender<S>,
     permit_fut: Option<OwnedPermitFuture<S>>,
@@ -182,7 +187,16 @@ where
             )));
         }
         ready!(self.poll_permit(cx))?;
-        let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
+        let (msg, writable) = match self.poll_mk_msg(cx, buf) {
+            Poll::Ready(made) => made,
+            Poll::Pending => {
+                // Out of window (or waiting for its lock): the place in the
+                // session's queue goes back so nothing is parked on this
+                // channel's behalf; the next poll takes a place again.
+                self.permit = None;
+                return Poll::Pending;
+            }
+        };
         self.send_with_permit(msg);
         Poll::Ready(Ok(writable.into()))
     }
