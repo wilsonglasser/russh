@@ -130,6 +130,11 @@ impl WindowSizeRef {
         }
     }
 
+    /// The peer re-opened its window by `amount`. Added to what the
+    /// writers have left, never set from the session's own count: bytes a
+    /// writer has reserved and already handed over are still on their way
+    /// to the session, and a count taken from there would offer them
+    /// twice.
     pub(crate) async fn grow(&self, amount: u32) {
         let mut value = self.value.lock().await;
         *value = value.saturating_add(amount);
@@ -393,43 +398,48 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         Ok(())
     }
 
-    async fn reserve_writable_chunk(&self, remaining: usize) -> Result<usize, Error> {
-        if self.max_packet_size == 0 {
-            return Err(Error::Inconsistent);
-        }
-        loop {
-            let mut window_size = self.window_size.value.lock().await;
-            let writable = (self.max_packet_size as usize)
-                .min(*window_size as usize)
-                .min(remaining);
-            if writable > 0 {
-                *window_size -= writable as u32;
-                if *window_size > 0 {
-                    self.window_size.notifier.notify_one();
-                }
-                return Ok(writable);
-            }
-            let notified = self.window_size.notifier.notified();
-            drop(window_size);
-            notified.await;
-        }
-    }
-
     async fn send_bytes(&self, ext: Option<u32>, data: Bytes) -> Result<(), Error> {
         if data.is_empty() {
             return Ok(());
         }
+        if self.max_packet_size == 0 {
+            return Err(Error::Inconsistent);
+        }
 
         let mut offset = 0;
         while offset < data.len() {
-            let writable = self.reserve_writable_chunk(data.len() - offset).await?;
+            // A place in the session's queue first, then the window, with
+            // the reservation and the send in one step so a caller that
+            // gives up waiting has taken no window. A writer OUT of window
+            // gives its place back while it waits: a place held through
+            // that wait is a slot of the session's queue parked for as
+            // long as the peer does not read, and enough of those (one
+            // per channel) stop every other channel's messages, the
+            // opens and the close included.
+            let slot = self.reserve_slot().await?;
+            let mut window_size = self.window_size.value.lock().await;
+            let writable = (self.max_packet_size as usize)
+                .min(*window_size as usize)
+                .min(data.len() - offset);
+            if writable == 0 {
+                let notified = self.window_size.notifier.notified();
+                drop(window_size);
+                drop(slot);
+                notified.await;
+                continue;
+            }
+            *window_size -= writable as u32;
+            if *window_size > 0 {
+                self.window_size.notifier.notify_one();
+            }
+            drop(window_size);
             let end = offset + writable;
             let chunk = data.slice(offset..end);
             let msg = match ext {
                 None => ChannelMsg::Data { data: chunk },
                 Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
             };
-            self.send_msg(msg).await?;
+            slot.send((self.id, msg).into());
             offset = end;
         }
 
@@ -454,6 +464,14 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             .send((self.id, msg).into())
             .await
             .map_err(|_| Error::SendError)
+    }
+
+    /// A place in the session's queue, taken BEFORE any window is
+    /// reserved: the reservation and the send then happen with no await
+    /// between them, so a caller that gives up waiting (a timeout, a
+    /// `select!`) can never have taken window it will not use.
+    async fn reserve_slot(&self) -> Result<tokio::sync::mpsc::Permit<'_, S>, Error> {
+        self.sender.reserve().await.map_err(|_| Error::SendError)
     }
 
     /// Make a writer for the [`Channel`] to send [`ChannelMsg::Data`]
@@ -1261,6 +1279,129 @@ mod tests {
             ChannelMsg::WindowAdjusted { new_size: 1 }
         ));
         assert_eq!(queue_len(&b, id), Some(1));
+    }
+
+    /// A channel with a 100-byte window whose session queue holds ONE
+    /// message and is never drained, so a second send waits on the queue.
+    fn channel_with_full_queue() -> (Channel<(ChannelId, ChannelMsg)>, mpsc::Receiver<(ChannelId, ChannelMsg)>) {
+        channel_with(1, 100)
+    }
+
+    /// A channel over a session queue `capacity` deep, with `window`
+    /// bytes to send.
+    fn channel_with(
+        capacity: usize,
+        window: u32,
+    ) -> (Channel<(ChannelId, ChannelMsg)>, mpsc::Receiver<(ChannelId, ChannelMsg)>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (channel, _reference) = Channel::<(ChannelId, ChannelMsg)>::new(
+            ChannelId(10),
+            sender,
+            1024,
+            window,
+            8,
+            Arc::new(Notify::new()),
+        );
+        (channel, receiver)
+    }
+
+    async fn window_left(channel: &Channel<(ChannelId, ChannelMsg)>) -> u32 {
+        *channel.write_half.window_size.value.lock().await
+    }
+
+    /// A write that is given up on while it waits for its place in the
+    /// session's queue has taken nothing from the window: the window is
+    /// reserved only in the same step that hands the message over.
+    #[tokio::test]
+    async fn a_write_given_up_on_takes_no_window() {
+        use tokio::io::AsyncWriteExt;
+        let short = std::time::Duration::from_millis(50);
+
+        let (channel, _queue) = channel_with_full_queue();
+        channel.data(&b"first"[..]).await.unwrap();
+        assert_eq!(window_left(&channel).await, 95);
+        // The queue is full: this one waits, and the caller stops waiting.
+        assert!(tokio::time::timeout(short, channel.data(&b"abandoned"[..])).await.is_err());
+        assert_eq!(window_left(&channel).await, 95, "the abandoned send reserved nothing");
+
+        let (channel, _queue) = channel_with_full_queue();
+        let mut writer = channel.make_writer();
+        writer.write_all(b"first").await.unwrap();
+        assert_eq!(window_left(&channel).await, 95);
+        assert!(tokio::time::timeout(short, writer.write_all(b"abandoned")).await.is_err());
+        drop(writer);
+        assert_eq!(window_left(&channel).await, 95, "the dropped writer reserved nothing");
+    }
+
+    /// A writer that waits for the window holds no place in the session's
+    /// queue while it waits: the other channels' messages, and this one's
+    /// close, still go through, and the write finishes once the window
+    /// re-opens.
+    #[tokio::test]
+    async fn a_writer_out_of_window_holds_no_place_in_the_queue() {
+        use tokio::io::AsyncWriteExt;
+        let short = std::time::Duration::from_millis(50);
+
+        // `channel.data`: window 5, queue 2 deep. The first write takes
+        // the window and one place; the second finds no window.
+        let (channel, mut queue) = channel_with(2, 5);
+        channel.data(&b"hello"[..]).await.unwrap();
+        assert_eq!(window_left(&channel).await, 0);
+        let parked = channel.data(&b"more"[..]);
+        tokio::pin!(parked);
+        assert!(tokio::time::timeout(short, &mut parked).await.is_err());
+        assert_eq!(channel.write_half.sender.capacity(), 1, "the parked write holds no place");
+        tokio::time::timeout(short, channel.close())
+            .await
+            .expect("the close is not held up by the parked write")
+            .unwrap();
+        assert_eq!(channel.write_half.sender.capacity(), 0);
+        // The session drains the queue and the peer re-opens the window.
+        queue.recv().await.unwrap();
+        queue.recv().await.unwrap();
+        channel.write_half.window_size.grow(5).await;
+        tokio::time::timeout(short, &mut parked)
+            .await
+            .expect("the parked write resumes on the window")
+            .unwrap();
+        assert_eq!(window_left(&channel).await, 1);
+
+        // Same through the `AsyncWrite` writer.
+        let (channel, mut queue) = channel_with(2, 5);
+        let mut writer = channel.make_writer();
+        writer.write_all(b"hello").await.unwrap();
+        assert_eq!(window_left(&channel).await, 0);
+        let parked = writer.write_all(b"more");
+        tokio::pin!(parked);
+        assert!(tokio::time::timeout(short, &mut parked).await.is_err());
+        assert_eq!(channel.write_half.sender.capacity(), 1, "the parked writer holds no place");
+        tokio::time::timeout(short, channel.close())
+            .await
+            .expect("the close is not held up by the parked writer")
+            .unwrap();
+        queue.recv().await.unwrap();
+        queue.recv().await.unwrap();
+        channel.write_half.window_size.grow(5).await;
+        tokio::time::timeout(short, &mut parked)
+            .await
+            .expect("the parked writer resumes on the window")
+            .unwrap();
+        assert_eq!(window_left(&channel).await, 1);
+    }
+
+    /// Bytes a writer reserved and handed over, still on their way to the
+    /// session, are not offered again when the peer re-opens its window.
+    #[tokio::test]
+    async fn bytes_on_their_way_are_not_offered_twice() {
+        let (channel, _queue) = channel_with_full_queue();
+        // 10 bytes reserved and queued; the session has not seen them.
+        channel.data(&[0u8; 10][..]).await.unwrap();
+        assert_eq!(window_left(&channel).await, 90);
+        // The session learns of a 50-byte adjust: the writers may send 50
+        // more than they could, not 150 as a count taken from the session
+        // (which still thinks 100 are free) would say.
+        channel.write_half.window_size.grow(50).await;
+        assert_eq!(window_left(&channel).await, 140);
     }
 
     #[tokio::test]
